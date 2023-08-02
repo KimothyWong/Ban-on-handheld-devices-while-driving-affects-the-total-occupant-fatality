@@ -1,0 +1,325 @@
+---
+title: "Poster"
+author: "Kimothy Wong"
+date: "2023-06-09"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+library(plm) # for random effects and fixed effects
+library(tidyverse) # for filter and mutate 
+library(stargazer)
+library(wooldridge)
+library(estimatr)
+library(lmtest)
+library(sandwich)
+library(fixest)
+library(ggplot2)
+library(dplyr)
+
+setwd("/Users/kimothywong/Desktop/2023 Spring/GPEC 446")
+load("traffic_fat.Rda")
+
+names(traffic_fat)
+traffic_fat -> traffic
+#traffic <- select(traffic, state, name, year, hha, occfat, totpop, rurdense, urbdense, vcrimetot, pcrimetot)
+View(traffic_fat)
+
+```
+
+
+
+```{r}
+
+# Treatment dummy
+traffic <- traffic %>%
+  mutate(
+    treatyear = if_else(hha > 0 & # does a coal plant shut down
+                          !is.na(hha), 
+                        year, 
+                        NA
+    ) # this is only defined in the actual year of treatment
+  ) %>%
+  group_by(name) %>%
+  mutate(
+    # so create variable that tells us the treatment year for each row/year
+    mintreatyear = min(treatyear, na.rm = TRUE),
+    # add this step to handle untreated areas
+    mintreatyear = if_else(is.infinite(mintreatyear), NA, mintreatyear),
+    # create a treatment group indicator
+    treatment_group = if_else(is.na(mintreatyear) == FALSE, 1, 0)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    treat = if_else(year >= mintreatyear, 1, 0), # treated var
+    tau = year - mintreatyear # relative treatment year: year to/since treatment
+  ) %>%
+  replace_na(list(treat = 0, tau = 0, mintreatyear = 0)) 
+View(traffic)
+
+```
+
+
+Motivation plot
+```{r}
+filtered_traffic <- traffic %>%
+  filter(year >= 2001 & year <= 2012)
+
+mean_fatality <- filtered_traffic %>%
+  group_by(year, treat) %>%
+  summarize(mean_fatality = mean(occfat))
+
+ggplot(mean_fatality, aes(x = as.character(year), y = mean_fatality, fill = factor(treat))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Year", y = "Mean Occupant Fatality", fill = "Treatment", title = "Mean Occupant Fatality 2001-2012 across all states") +
+  scale_fill_manual(values = c("0" = "coral1", "1" = "cornsilk")) +
+  theme_minimal()
+
+```
+
+
+```{r}
+
+did_dynamic_balanced <- 
+  feols(
+    occfat ~ i(tau, ref = -1) | year + name,
+    data = traffic, 
+    subset = ~ (tau >= -13 & tau <= 11) # 13 years pre, 10 years post
+    & ((mintreatyear >= 2001 & mintreatyear <= 2012) | 
+         mintreatyear == 0), 
+    # so mintreatyear is 2007 to 2012
+    cluster = ~ name # correct for serial correlation within states
+  )
+etable(did_dynamic_balanced)
+
+iplot(
+  did_dynamic_balanced,
+  xlab = "Relative Treatment Year", # horizontal axis label
+  main = "Effect on Total Occupant Fatality  (Dynamic DID)" # title
+)
+
+```
+
+
+
+DID
+```{r}
+
+did <- 
+  feols(
+    occfat ~ treat + totpop + rurdense + urbdense + fueltax | year + name,
+    data = traffic, 
+    cluster = ~ name # correct for serial correlation within states
+  )
+etable(did)
+```
+
+```{r}
+coefplot(did, main = "Effect on Total Occupant Fatality")
+```
+
+
+
+
+
+
+
+
+
+```{r}
+## Lowess graph, descriptive visualization
+data_frame_for_plotting <- 
+  traffic %>%
+  filter(treatment_group == 1) # only keep the ever treated groups
+
+# split data into pre and post data frames
+data_left <- 
+  filter(
+    data_frame_for_plotting,
+    tau >= -6,
+    tau <= -1
+  )
+
+data_right <- 
+  filter(
+    data_frame_for_plotting,
+    tau >= 0,
+    tau <= 4
+  )
+
+# Plot it
+ggplot() +
+  geom_smooth(
+    data = data_left, # left side of the graph (pre period)
+    mapping = aes(x = tau, y = occfat),
+    method = "loess",
+    se = FALSE
+  ) +
+  geom_smooth(
+    data = data_right, # right side of the graph (post period)
+    mapping = aes(x = tau, y = occfat),
+    method = "loess",
+    se = FALSE
+  ) +
+  # se = FALSE to save computing power, try removing/waiting-long-time
+  geom_vline(xintercept = -0.5, linetype = "dashed") + # vertical line
+  labs(x = "Relative Treatment Year", y = "Average Occupant Fatality") +
+  coord_cartesian(xlim = c(-6, 4))
+
+```
+
+
+
+
+
+```{r}
+did_sunab_balanced <- 
+  feols(
+    # the formula looks similar, but we include the sunab() subcommand
+    # we tell sunab the treatment cohort and the year
+    # where the treatment cohort are the observations treated in a the same year
+    occfat ~ sunab(mintreatyear, year) | year + name,
+    data = traffic,
+    cluster = ~ name,
+    # subsetting the data is not strictly necessary, sunab will make all the 
+    # correct comparisons, but this will make those results more comparable
+    subset = ~ (tau >= -13 & tau <= 11) # six years pre, five years post
+    & ((mintreatyear >= 2001 & mintreatyear <= 2012) | 
+         mintreatyear == 0), 
+    # so mintreatyear is 2007 to 2012
+  )
+etable(did_sunab_balanced) 
+
+```
+
+
+```{r}
+iplot(
+  list(did_sunab_balanced), # you can see how the forbidden comparisons
+  # lead to different estimates
+  xlab = "Relative Treatment Year", # horizontal axis label
+  main = "Effect on Total Occupant Fatality (Sun & Abraham Estimator)" # title
+)
+```
+
+
+
+```{r}
+iplot(
+  list(did_dynamic_balanced, did_sunab_balanced),
+  xlab = "Relative Treatment Year",
+  main = "Effect on Total Occupant Fatality"
+)
+
+# Add legend
+legend("bottomleft", legend = c("Dynamic DID", "SUN & ABRAHAM"), col = 1:2, lty = 1)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+etable(did, did_dynamic_balanced)
+```
+
+
+
+Robustness Check
+```{r}
+
+did_robust_check <- 
+  feols( 
+    occfat ~ treat + totpop + rurdense + urbdense + fueltax + sbprim + sbsec + bac08 + pbt + admin + txt + hhlearn | year + name,
+    data = traffic, 
+    cluster = ~ name # correct for serial correlation within states
+  )
+etable(did_robust_check)
+```
+
+
+
+
+```{r}
+names(traffic)
+```
+
+
+robustness check
+```{r}
+reg_pols <- 
+  plm(
+    occfat ~ treat + totpop + rurdense + urbdense + fueltax,
+    model = "pooling",
+    index = "name",
+    traffic)
+
+re <- plm(occfat ~ treat + totpop + rurdense + urbdense + fueltax,
+          index = c("name"),
+          model = "random",
+          traffic)
+
+
+fe <- plm(occfat ~ treat + totpop + rurdense + urbdense + fueltax,
+              index = "name",
+              model = "within",
+              traffic)
+
+stargazer(reg_pols, re, fe,
+  type = "text",
+  dep.var.labels = "Occupant Fatality",
+  covariate.labels = c("treat"),
+  keep = c("treat", "fueltax"),
+  column.labels = c("POLS","RE","FE"),
+  title = "POLS, RE and FE regression",
+  header=FALSE)
+
+```
+
+
+```{r}
+phtest(re,fe)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#rm(list = ls())
+```
+
